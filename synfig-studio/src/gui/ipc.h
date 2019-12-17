@@ -42,11 +42,13 @@ namespace studio {
 class IPC
 {
 private:
+	class Internal;
 
+	Internal *internal;
 	int fd;
 	synfig::SmartFILE file;
 
-	bool fifo_activity(Glib::IOCondition cond);
+    bool fifo_activity(Glib::IOCondition cond);
 
 public:
 	IPC();

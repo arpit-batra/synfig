@@ -64,11 +64,15 @@
 #include "docks/dock_toolbox.h"
 #include <glibmm/dispatcher.h>
 #include <mutex>
+#include <condition_variable>
 #include <thread>
 #include <synfig/string.h>
 #include <synfigapp/main.h>
 #include <glibmm/miscutils.h>
+
 #ifdef _WIN32
+#define WINVER       0x0600
+#define _WIN32_WINNT 0x0600
 #include <windows.h>
 #define BUFSIZE   128
 #define read	_read
@@ -90,76 +94,111 @@ using namespace studio;
 /* === G L O B A L S ======================================================= */
 
 #ifdef _WIN32
+
 #define WIN32_PIPE_PATH "\\\\.\\pipe\\SynfigStudio.Cmd"
-static std::mutex cmd_mutex;
-static std::list<synfig::String> cmd_queue;
-static Glib::Dispatcher* cmd_dispatcher;
-static std::atomic<bool> thread_should_quit(false);
-std::thread *cmd_thread = nullptr;
-static void
-pipe_listen_thread()
-{
-	while(!thread_should_quit)
-	{
-		HANDLE pipe_handle;
-		pipe_handle=CreateNamedPipe(
-			WIN32_PIPE_PATH, // pipe name
-			PIPE_ACCESS_INBOUND, // Access type
-			PIPE_READMODE_BYTE /*|PIPE_NOWAIT*/,
-			PIPE_UNLIMITED_INSTANCES,
-			BUFSIZE,
-			BUFSIZE,
-			NMPWAIT_USE_DEFAULT_WAIT,
-			NULL
-		);
-		if(pipe_handle==INVALID_HANDLE_VALUE)
-		{
-			synfig::error("IPC(): Call to CreateNamedPipe failed. Ignore next error. GetLastError=%d",GetLastError());
-			return;
+
+class IPC::Internal {
+private:
+	std::mutex mutex;
+	std::condition_variable cond;
+	
+	std::list<synfig::String> queue;
+	Glib::Dispatcher dispatcher;
+	
+	std::atomic<bool> thread_stop;
+	std::thread *thread;
+	WORD thread_id;
+
+	void pipe_listen_thread() {
+		{ // get windows thread id
+			std::unique_lock<std::mutex> lock(mutex);
+			thread_id = GetCurrentThreadId();
+			cond.notify_all();
 		}
+		
+		while(!thread_stop) {
+			HANDLE pipe_handle;
+			pipe_handle=CreateNamedPipe(
+				WIN32_PIPE_PATH, // pipe name
+				PIPE_ACCESS_INBOUND, // Access type
+				PIPE_READMODE_BYTE,
+				PIPE_UNLIMITED_INSTANCES,
+				BUFSIZE,
+				BUFSIZE,
+				NMPWAIT_USE_DEFAULT_WAIT,
+				NULL );
+			if (pipe_handle==INVALID_HANDLE_VALUE) {
+				synfig::error("IPC(): Call to CreateNamedPipe failed. Ignore next error. GetLastError=%d",GetLastError());
+				return;
+			}
 
-		bool connected;
-		connected=ConnectNamedPipe(pipe_handle,NULL)?true:(GetLastError()==ERROR_PIPE_CONNECTED);
-		DWORD read_bytes;
-		bool success;
+			bool connected = ConnectNamedPipe(pipe_handle, NULL)
+						  || GetLastError() == ERROR_PIPE_CONNECTED;
+			std::this_thread::yield();
 
-		std::this_thread::yield();
+			DWORD read_bytes;
+			bool success;
+			if (connected) do {
+				String data;
+				char c;
+				do {
+					success = ReadFile(
+						pipe_handle,
+						&c,		// buffer pointer
+						1,		// buffer size
+						&read_bytes,
+						NULL );
+					if (success && read_bytes==1 && c!='\n')
+						data += c;
+				} while(!thread_stop || c != '\n');
+				
+				std::lock_guard<std::mutex> lock(mutex);
+				queue.push_back(data);
+				dispatcher.emit();
+			} while(success && read_bytes && !thread_stop);
 
-		if(connected)
-		do {
-			String data;
-			char c;
-			do
-			{
-				success= ReadFile(
-					pipe_handle,
-					&c,		// buffer pointer
-					1,		// buffer size
-					&read_bytes,
-					NULL
-				);
-				if(success && read_bytes==1 && c!='\n')
-					data+=c;
-			} while (!thread_should_quit || c != '\n');
-			std::lock_guard<std::mutex> lock(cmd_mutex);
-			cmd_queue.push_back(data);
-			cmd_dispatcher->emit();
-		} while(success && read_bytes && !thread_should_quit);
-
-		CloseHandle(pipe_handle);
+			CloseHandle(pipe_handle);
+		}
 	}
-}
 
-static void
-empty_cmd_queue()
-{
-	std::lock_guard<std::mutex> lock(cmd_mutex);
-	while(!cmd_queue.empty())
+	void empty_queue() {
+		std::lock_guard<std::mutex> lock(mutex);
+		while(!queue.empty()) {
+			IPC::process_command(queue.front());
+			queue.pop_front();
+		}
+	}
+
+public:
+	Internal():
+		thread_stop(false),
+		thread(),
+		thread_id()
 	{
-		IPC::process_command(cmd_queue.front());
-		cmd_queue.pop_front();
+		dispatcher.connect(sigc::mem_fun(*this, &Internal::empty_queue));
+
+		// create thread and wait until new thread captured self id
+		std::unique_lock<std::mutex> lock(mutex);
+		thread = new std::thread(&Internal::pipe_listen_thread, this);
+		cond.wait(lock);
 	}
-}
+
+	~Internal() {
+		thread_stop = true;
+		if (HANDLE thread_handle = OpenThread(THREAD_TERMINATE, FALSE, thread_id)) {
+			CancelSynchronousIo(thread_handle);
+			CloseHandle(thread_handle);
+			thread->join();
+		} else {
+			synfig::error("IPC(): Cannot terminate IPC thread");
+		}
+		delete thread;
+	}
+};
+
+#else // ifdef WIN32
+
+class Internal { };
 
 #endif
 
@@ -167,45 +206,27 @@ empty_cmd_queue()
 
 /* === M E T H O D S ======================================================= */
 
-IPC::IPC()
+IPC::IPC():
+	internal(),
+	fd(-1)
 {
 #ifdef _WIN32
-
-	cmd_dispatcher=new Glib::Dispatcher;
-	cmd_dispatcher->connect(sigc::ptr_fun(empty_cmd_queue));
-
-	thread_should_quit = false;
-
-	cmd_thread = new std::thread(pipe_listen_thread);
+	internal = new Internal();
 #else
-
 	remove(fifo_path().c_str());
-	fd=-1;
-
-	if(mkfifo(fifo_path().c_str(), S_IRWXU)!=0)
-	{
+	if (mkfifo(fifo_path().c_str(), S_IRWXU) != 0)
 		synfig::error("IPC(): mkfifo failed for "+fifo_path());
-	}
 
-	{
-		fd=open(fifo_path().c_str(),O_RDWR);
-
-
-		if(fd<0)
-		{
-			synfig::error("IPC(): Failed to open fifo \"%s\". (errno=?)",fifo_path().c_str());
-			//synfig::error("IPC(): Failed to open fifo \"%s\". (errno=%d)",fifo_path().c_str(),::errno);
-		}
-		else
-		{
-			file=SmartFILE(fdopen(fd,"r"));
-
-			Glib::signal_io().connect(
-				sigc::mem_fun(this,&IPC::fifo_activity),
-				fd,
-				Glib::IO_IN|Glib::IO_PRI|Glib::IO_ERR|Glib::IO_HUP|Glib::IO_NVAL
-			);
-		}
+	fd = open(fifo_path().c_str(),O_RDWR);
+	if (fd < 0) {
+		synfig::error("IPC(): Failed to open fifo \"%s\". (errno=?)",fifo_path().c_str());
+		//synfig::error("IPC(): Failed to open fifo \"%s\". (errno=%d)",fifo_path().c_str(),::errno);
+	} else {
+		file = SmartFILE(fdopen(fd,"r"));
+		Glib::signal_io().connect(
+			sigc::mem_fun(this,&IPC::fifo_activity),
+			fd,
+			Glib::IO_IN|Glib::IO_PRI|Glib::IO_ERR|Glib::IO_HUP|Glib::IO_NVAL );
 	}
 #endif
 }
@@ -217,12 +238,7 @@ IPC::~IPC()
 
 	remove(fifo_path().c_str());
 #ifdef _WIN32
-	thread_should_quit = true;
-	CancelSynchronousIo(cmd_thread);
-	if (cmd_thread->joinable())
-		cmd_thread->join();
-	delete cmd_thread;
-	delete cmd_dispatcher;
+	delete internal;
 #endif
 	//if(fd>=0)
 	//	close(fd);

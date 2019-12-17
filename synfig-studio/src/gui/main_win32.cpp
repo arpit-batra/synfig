@@ -36,6 +36,8 @@ using namespace std;
 
 #define MAX_LINES 500
 
+#define WINVER       0x0600
+#define _WIN32_WINNT 0x0600
 #include <windows.h>
 #include <wincon.h>
 
